@@ -19,7 +19,8 @@ CHANNEL = "@AlMaNewsToday"
 SOURCES = ["topor", "uranews", "theohdaily", "Dyadyabatya0"]  # username без @
 SIGNATURE = "@AlMaNewsToday"  # подпись в конце поста; "" = без подписи
 USE_MEDIA = True              # брать все фото и видео из исходного поста
-MAX_AGE_HOURS = 6             # посты старше этого не берём
+MAX_AGE_DAY_HOURS = 1         # днём берём только посты не старше часа
+MAX_AGE_NIGHT_HOURS = 2       # ночью запуски реже, поэтому окно шире
 MIN_LENGTH = 80               # слишком короткие посты пропускаем
 DAY_FROM_HOUR = 8             # "день" по Москве: с 08:00 до 23:00
 DAY_TO_HOUR = 23              # (частоту запусков задаёт cron в news.yml)
@@ -485,6 +486,7 @@ def main():
             seen.add(post_id)
             state["seen"].append(post_id)
 
+    max_age = MAX_AGE_DAY_HOURS if is_day else MAX_AGE_NIGHT_HOURS
     candidates = []
     failed_sources = 0
     for source in SOURCES:
@@ -497,7 +499,7 @@ def main():
         for p in posts:
             if p["id"] in seen:
                 continue
-            if now - p["date"] > timedelta(hours=MAX_AGE_HOURS):
+            if now - p["date"] > timedelta(hours=max_age):
                 continue
             candidates.append(p)
 
