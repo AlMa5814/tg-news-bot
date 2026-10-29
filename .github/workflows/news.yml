@@ -2,9 +2,8 @@ name: news
 
 on:
   schedule:
-    # время в UTC (Москва = UTC+3)
-    - cron: "*/15 5-19 * * *"      # день: 08:00-22:45 по Москве, каждые 15 минут
-    - cron: "0 20-23,0-4 * * *"    # ночь: 23:00-07:00 по Москве, раз в час
+    # время в UTC; бот сам различает день и ночь по московскому времени
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       max_age_hours:
@@ -48,4 +47,11 @@ jobs:
           git config user.name "news-bot"
           git config user.email "bot@users.noreply.github.com"
           if [ -f state.json ]; then git add state.json; fi
-          git diff --cached --quiet || (git commit -m "update state" && git push)
+          if ! git diff --cached --quiet; then
+            git commit -m "update state"
+            for i in 1 2 3; do
+              git push && break
+              git pull --rebase -X theirs || git rebase --abort
+              sleep 3
+            done
+          fi
