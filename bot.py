@@ -30,7 +30,7 @@ SIGNATURE = "@AlMaNewsToday"  # подпись в конце поста; "" = б
 USE_MEDIA = True              # брать все фото и видео из исходного поста
 MAX_AGE_DAY_HOURS = 3         # окно свежести днём (запас на задержки cron; повторы режет seen)
 MAX_AGE_NIGHT_HOURS = 4       # ночью постов меньше, окно шире
-MIN_LENGTH = 80               # слишком короткие посты пропускаем
+MIN_LENGTH = 20               # слишком короткие посты пропускаем (защита от пустых и обрывков)
 DAY_FROM_HOUR = 8             # "день" по Москве: с 08:00 до 23:00
 DAY_TO_HOUR = 23
 DAY_POSTS_PER_RUN = 1         # постов за запуск днём (2, если очередь большая)
@@ -786,7 +786,7 @@ def main():
             mark(p["id"], f"ИИ: {new[:9].upper().strip('. ')}")
             continue
         new = postprocess(new)
-        if len(new) < 40 or len(new) > 2.5 * len(p["clean"]) + 200:
+        if len(new) < 15 or len(new) > 2.5 * len(p["clean"]) + 200:
             print(f"{p['id']}: ответ ИИ выглядит странно (длина {len(new)}), пропускаю")
             mark(p["id"], "странный ответ ИИ")
             continue
