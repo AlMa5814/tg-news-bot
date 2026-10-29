@@ -6,6 +6,10 @@ on:
     - cron: "*/15 5-19 * * *"      # день: 08:00-22:45 по Москве, каждые 15 минут
     - cron: "0 20-23,0-4 * * *"    # ночь: 23:00-07:00 по Москве, раз в час
   workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: "Для теста: брать посты за последние N часов (например 24). Пусто = обычный режим"
+        required: false
 
 permissions:
   contents: write
@@ -35,6 +39,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          MAX_AGE_OVERRIDE: ${{ github.event.inputs.max_age_hours }}
         run: python bot.py
 
       - name: Save state
