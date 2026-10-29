@@ -21,9 +21,11 @@ SIGNATURE = "@AlMaNewsToday"  # подпись в конце поста; "" = б
 USE_MEDIA = True              # брать все фото и видео из исходного поста
 MAX_AGE_HOURS = 6             # посты старше этого не берём
 MIN_LENGTH = 80               # слишком короткие посты пропускаем
-PUBLISH_FROM_HOUR = 8         # публикуем с 08:00 по Москве
-PUBLISH_TO_HOUR = 23          # и до 23:59
-DAILY_LIMIT = 20              # максимум постов в сутки
+DAY_FROM_HOUR = 8             # "день" по Москве: с 08:00 до 23:00
+DAY_TO_HOUR = 23              # (частоту запусков задаёт cron в news.yml)
+NIGHT_POSTS_PER_RUN = 2       # ночью запуск раз в час, поэтому можно 2 поста за раз
+DAILY_LIMIT = 60              # максимум постов в сутки
+RECENT_FOR_AI = 15            # сколько последних постов показывать ИИ для проверки повторов
 
 GEMINI_MODEL = "gemini-2.5-flash"
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -68,6 +70,12 @@ PROMPT = """Ты редактор новостного канала. Переп�
 Если текст является рекламой, розыгрышем, приглашением подписаться или не \
 является новостью, ответь одним словом: SKIP
 
+Последние новости, уже опубликованные в канале:
+{recent}
+
+Если новость в тексте ниже описывает то же событие, что одна из опубликованных \
+выше (пусть другими словами или с другими подробностями), ответь одним словом: DUPLICATE
+
 Текст:
 {text}
 """
@@ -85,6 +93,7 @@ def load_state():
 def save_state(state):
     state["seen"] = state.get("seen", [])[-3000:]
     state["recent"] = state.get("recent", [])[-40:]
+    state["posts"] = state.get("posts", [])[-30:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
 
@@ -390,9 +399,10 @@ def call_openai_compat(url, key, model, prompt):
     return r.json()["choices"][0]["message"]["content"]
 
 
-def rewrite(text):
-    """Пробует ИИ по очереди. Возвращает текст, "SKIP" или None, если все упали."""
-    prompt = PROMPT.format(n=len(text), text=text)
+def rewrite(text, recent_posts):
+    """Пробует ИИ по очереди. Возвращает текст, "SKIP"/"DUPLICATE" или None, если все упали."""
+    recent = "\n".join(f"- {t}" for t in recent_posts) or "(пока нет)"
+    prompt = PROMPT.format(n=len(text), text=text, recent=recent)
     attempts = []  # (подпись, провайдер, модель, вызов)
     if os.getenv("GEMINI_API_KEY"):
         for m in get_models("gemini"):
@@ -453,9 +463,7 @@ def main():
 
     now = datetime.now(timezone.utc)
     msk = now.astimezone(MSK)
-    if not (PUBLISH_FROM_HOUR <= msk.hour <= PUBLISH_TO_HOUR):
-        print("Тихие часы, пропускаю")
-        return
+    is_day = DAY_FROM_HOUR <= msk.hour < DAY_TO_HOUR
 
     state = load_state()
     today = msk.strftime("%Y-%m-%d")
@@ -469,6 +477,7 @@ def main():
 
     state.setdefault("seen", [])
     state.setdefault("recent", [])
+    state.setdefault("posts", [])
     seen = set(state["seen"])
 
     def mark(post_id):
@@ -497,7 +506,7 @@ def main():
     print(f"Кандидатов: {len(candidates)}")
 
     candidates.sort(key=lambda p: p["date"], reverse=True)  # свежие первыми
-    per_run = 2 if len(candidates) > 15 else 1
+    per_run = (2 if len(candidates) > 15 else 1) if is_day else NIGHT_POSTS_PER_RUN
     published = 0
     had_error = False
 
@@ -509,12 +518,13 @@ def main():
             mark(p["id"])
             continue
 
-        new = rewrite(text)
+        new = rewrite(text, state["posts"][-RECENT_FOR_AI:])
         if new is None:
             alert("все ИИ не ответили, повторю при следующем запуске")
             had_error = True
             break
-        if new.upper().startswith("SKIP"):
+        if new.upper().startswith(("SKIP", "DUPLICATE")):
+            print(f"{p['id']}: пропущен ИИ ({new[:9]})")
             mark(p["id"])
             continue
         new = postprocess(new)
@@ -532,6 +542,7 @@ def main():
         mark(p["id"])
         state["count"] += 1
         state["recent"].append(sorted(words(new))[:80])
+        state["posts"].append(new[:250].replace("\n", " "))
         published += 1
         print(f"Опубликован пост из {p['id']}")
         save_state(state)
