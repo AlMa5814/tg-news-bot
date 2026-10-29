@@ -5,7 +5,9 @@
 и публикует в канал. Запускается по расписанию из GitHub Actions.
 """
 import json
+import math
 import os
+import random
 import re
 import statistics
 import sys
@@ -33,8 +35,11 @@ MAX_AGE_NIGHT_HOURS = 4       # ночью постов меньше, окно �
 MIN_LENGTH = 20               # слишком короткие посты пропускаем (защита от пустых и обрывков)
 DAY_FROM_HOUR = 8             # "день" по Москве: с 08:00 до 23:00
 DAY_TO_HOUR = 23
-DAY_POSTS_PER_RUN = 1         # постов за запуск днём (2, если очередь большая)
-NIGHT_POSTS_PER_RUN = 1       # постов за запуск ночью
+QUEUE_SHARE = 0.25            # какую долю очереди публиковать за один запуск (0.25 = четверть)
+MIN_POSTS_PER_RUN = 1         # но не меньше стольки (если очередь не пуста)
+MAX_POSTS_PER_RUN = 5         # и не больше стольки, чтобы не заспамить канал
+POST_PAUSE_MIN_SEC = 30       # пауза между постами в одном запуске: случайная
+POST_PAUSE_MAX_SEC = 90       # от 30 секунд до 1,5 минуты
 DAILY_LIMIT = 80              # максимум постов в сутки
 RECENT_FOR_AI = 15            # сколько последних постов показывать ИИ для проверки повторов
 MIN_SCORE = 5                 # новости с оценкой ИИ ниже этого (шкала 1-10) не публикуем
@@ -759,16 +764,21 @@ def main():
     ranked.sort(key=lambda p: p["rank"], reverse=True)  # при равенстве остаётся порядок "свежие первыми"
 
     # 3. рерайт и публикация лучших
-    if is_day:
-        per_run = DAY_POSTS_PER_RUN + (1 if len(ranked) > 8 else 0)
-    else:
-        per_run = NIGHT_POSTS_PER_RUN
+    # сколько публиковать за запуск: доля очереди, но в пределах [MIN, MAX]
+    per_run = 0
+    if ranked:
+        per_run = max(MIN_POSTS_PER_RUN, min(MAX_POSTS_PER_RUN, math.ceil(len(ranked) * QUEUE_SHARE)))
+    print(f"В очереди {len(ranked)}, публикую за запуск до {per_run}")
     published = 0
     had_error = False
 
     for p in ranked:
         if published >= per_run or state["count"] >= DAILY_LIMIT:
             break
+        if published > 0:
+            pause = random.uniform(POST_PAUSE_MIN_SEC, POST_PAUSE_MAX_SEC)
+            print(f"Пауза {pause:.0f} с до следующего поста")
+            time.sleep(pause)
 
         # за этот же запуск мог выйти пост про то же событие из другого источника
         if is_duplicate(p["clean"], state):
