@@ -223,11 +223,12 @@ def fetch_source(name):
             src_url = v.get("src")
             if src_url and src_url not in [x["url"] for x in media]:
                 media.append({"type": "video", "url": src_url})
-        if w.select_one(
-            ".tgme_widget_message_video_player, .tgme_widget_message_roundvideo_player, "
-            "a.tgme_widget_message_video_wrap"
-        ) and not any(x["type"] == "video" for x in media):
-            print(f"{post_id}: видео слишком большое для веб-превью, пропускаю его")
+        big_video = bool(
+            w.select_one(
+                ".tgme_widget_message_video_player, .tgme_widget_message_roundvideo_player, "
+                "a.tgme_widget_message_video_wrap"
+            )
+        ) and not any(x["type"] == "video" for x in media)
         views = None
         v_el = w.select_one("span.tgme_widget_message_views")
         if v_el:
@@ -239,6 +240,7 @@ def fetch_source(name):
                 "date": datetime.fromisoformat(time_el["datetime"]),
                 "media": media[:10],
                 "views": views,
+                "big_video": big_video,
             }
         )
 
@@ -582,6 +584,14 @@ def main():
             state["seen"].append(post_id)
 
     max_age = MAX_AGE_DAY_HOURS if is_day else MAX_AGE_NIGHT_HOURS
+    override = os.getenv("MAX_AGE_OVERRIDE", "").strip()
+    if override:
+        try:
+            max_age = float(override)
+            print(f"ТЕСТ: окно свежести {max_age} ч")
+        except ValueError:
+            pass
+    print(f"Сейчас {msk:%H:%M} по Москве ({'день' if is_day else 'ночь'}), окно свежести {max_age} ч")
     candidates = []
     failed_sources = 0
     for source in SOURCES:
@@ -591,12 +601,22 @@ def main():
             print(f"Источник {source} не открылся: {type(e).__name__}")
             failed_sources += 1
             continue
+        stats = {"new": 0, "seen": 0, "old": 0}
         for p in posts:
             if p["id"] in seen:
+                stats["seen"] += 1
                 continue
             if now - p["date"] > timedelta(hours=max_age):
+                stats["old"] += 1
                 continue
+            stats["new"] += 1
             candidates.append(p)
+        newest = min((now - p["date"] for p in posts), default=None)
+        newest_txt = f"{int(newest.total_seconds() // 60)} мин назад" if newest else "нет постов"
+        print(
+            f"{source}: постов с текстом на странице {len(posts)}, самый свежий {newest_txt}; "
+            f"новых в окне {stats['new']}, уже обработано {stats['seen']}, старше окна {stats['old']}"
+        )
 
     if failed_sources == len(SOURCES):
         alert("ни один источник не открылся")
@@ -607,11 +627,21 @@ def main():
     pool = []
     for p in candidates:
         text = clean(p["text"])
-        if len(text) < MIN_LENGTH or is_ad(text) or is_duplicate(text, state):
+        reason = None
+        if len(text) < MIN_LENGTH:
+            reason = "слишком короткий"
+        elif is_ad(text):
+            reason = "реклама"
+        elif is_duplicate(text, state):
+            reason = "повтор уже опубликованного"
+        if reason:
+            print(f"{p['id']}: отсеян ({reason})")
             mark(p["id"])
             continue
         p["clean"] = text
         pool.append(p)
+        if p["big_video"]:
+            print(f"{p['id']}: видео слишком большое для веб-превью, публикую без него")
     pool = pool[:POOL_SIZE]
 
     # 2. оценка важности ИИ (один запрос на все новые посты, оценки запоминаются)
@@ -631,6 +661,7 @@ def main():
     for p in pool:
         p["ai"] = cached.get(p["id"])
         if p["ai"] is not None and p["ai"] < MIN_SCORE:
+            print(f"{p['id']}: оценка {p['ai']:g} ниже порога {MIN_SCORE}, пропускаю")
             mark(p["id"])  # неинтересное больше не рассматриваем
             continue
         base = p["ai"] if p["ai"] is not None else MIN_SCORE
