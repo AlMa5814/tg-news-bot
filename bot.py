@@ -246,9 +246,127 @@ def is_duplicate(text, state):
 
 
 # ---------------------- ИИ ----------------------
-def call_gemini(prompt):
+# Модели у провайдеров часто меняются, поэтому список доступных моделей
+# запрашивается у самого сервиса, а названия из настроек нужны только как запасные.
+GEMINI_LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GROQ_LIST_URL = "https://api.groq.com/openai/v1/models"
+OPENROUTER_LIST_URL = "https://openrouter.ai/api/v1/models"
+
+GEMINI_BAD = ["image", "tts", "audio", "live", "embed", "imagen", "veo", "thinking",
+              "learnlm", "gemma", "robotics", "computer", "native"]
+GROQ_BAD = ["whisper", "guard", "tts", "orpheus", "playai", "safeguard"]
+GROQ_PREF = ["gpt-oss-120b", "llama-3.3-70b", "llama-4-maverick", "llama-4-scout",
+             "qwen", "gpt-oss-20b", "llama-3.1-8b"]
+OPENROUTER_BAD = ["image", "embed", "audio", "guard", "moderation", "lyria", "tts"]
+OPENROUTER_PREF = ["gpt-oss-120b", "llama-3.3-70b", "qwen3", "deepseek", "gemma-3-27b",
+                   "mistral", "llama", "gemma"]
+
+_MODELS = {}
+
+
+def http_error_text(e):
+    resp = getattr(e, "response", None)
+    if resp is None:
+        return ""
+    return f"{resp.status_code} {resp.text[:200]}".replace("\n", " ")
+
+
+def pref_index(name, prefs):
+    low = name.lower()
+    for i, p in enumerate(prefs):
+        if p in low:
+            return i
+    return len(prefs)
+
+
+def list_gemini_models():
+    r = requests.get(
+        GEMINI_LIST_URL,
+        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+        params={"pageSize": 200},
+        timeout=30,
+    )
+    r.raise_for_status()
+    names = []
+    for m in r.json().get("models", []):
+        if "generateContent" not in m.get("supportedGenerationMethods", []):
+            continue
+        name = m["name"].split("/")[-1]
+        low = name.lower()
+        if "flash" not in low or any(b in low for b in GEMINI_BAD):
+            continue
+        names.append(name)
+
+    def key(n):
+        low = n.lower()
+        nums = re.findall(r"\d+(?:\.\d+)?", n)
+        version = float(nums[0]) if nums else 0.0
+        unstable = "preview" in low or "exp" in low
+        return (not unstable, "lite" not in low, version)
+
+    names.sort(key=key, reverse=True)
+    return names[:3]
+
+
+def list_groq_models():
+    r = requests.get(
+        GROQ_LIST_URL,
+        headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    ids = [
+        m["id"]
+        for m in r.json().get("data", [])
+        if not any(b in m["id"].lower() for b in GROQ_BAD)
+    ]
+    ids.sort(key=lambda n: pref_index(n, GROQ_PREF))
+    return ids[:3]
+
+
+def list_openrouter_models():
+    r = requests.get(OPENROUTER_LIST_URL, timeout=30)
+    r.raise_for_status()
+    ids = []
+    for m in r.json().get("data", []):
+        mid = m.get("id", "")
+        arch = m.get("architecture") or {}
+        if not mid.endswith(":free"):
+            continue
+        if any(b in mid.lower() for b in OPENROUTER_BAD):
+            continue
+        if "text" not in (arch.get("output_modalities") or ["text"]):
+            continue
+        if "text" not in (arch.get("input_modalities") or ["text"]):
+            continue
+        ids.append(mid)
+    ids.sort(key=lambda n: pref_index(n, OPENROUTER_PREF))
+    return ids[:5]
+
+
+LISTERS = {
+    "gemini": (list_gemini_models, lambda: [GEMINI_MODEL]),
+    "groq": (list_groq_models, lambda: [GROQ_MODEL]),
+    "openrouter": (list_openrouter_models, lambda: list(OPENROUTER_MODELS)),
+}
+
+
+def get_models(provider):
+    if provider not in _MODELS:
+        lister, default = LISTERS[provider]
+        try:
+            models = lister()
+            print(f"Модели {provider}: {', '.join(models) or 'пусто'}")
+            _MODELS[provider] = models or default()
+        except Exception as e:
+            print(f"Список моделей {provider} не получен ({type(e).__name__} {http_error_text(e)}), беру запасные")
+            _MODELS[provider] = default()
+    return _MODELS[provider]
+
+
+def call_gemini(prompt, model):
     r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
         json={"contents": [{"parts": [{"text": prompt}]}]},
         timeout=60,
@@ -275,40 +393,46 @@ def call_openai_compat(url, key, model, prompt):
 def rewrite(text):
     """Пробует ИИ по очереди. Возвращает текст, "SKIP" или None, если все упали."""
     prompt = PROMPT.format(n=len(text), text=text)
-    providers = []
+    attempts = []  # (подпись, провайдер, модель, вызов)
     if os.getenv("GEMINI_API_KEY"):
-        providers.append(("Gemini", lambda: call_gemini(prompt)))
+        for m in get_models("gemini"):
+            attempts.append((f"Gemini {m}", "gemini", m, lambda m=m: call_gemini(prompt, m)))
     if os.getenv("GROQ_API_KEY"):
-        providers.append(
-            (
-                "Groq",
-                lambda: call_openai_compat(
-                    GROQ_URL, os.environ["GROQ_API_KEY"], GROQ_MODEL, prompt
-                ),
-            )
-        )
-    if os.getenv("OPENROUTER_API_KEY"):
-        for model in OPENROUTER_MODELS:
-            providers.append(
+        for m in get_models("groq"):
+            attempts.append(
                 (
-                    f"OpenRouter {model}",
-                    lambda model=model: call_openai_compat(
-                        OPENROUTER_URL,
-                        os.environ["OPENROUTER_API_KEY"],
-                        model,
-                        prompt,
+                    f"Groq {m}",
+                    "groq",
+                    m,
+                    lambda m=m: call_openai_compat(
+                        GROQ_URL, os.environ["GROQ_API_KEY"], m, prompt
                     ),
                 )
             )
-    for name, fn in providers:
+    if os.getenv("OPENROUTER_API_KEY"):
+        for m in get_models("openrouter"):
+            attempts.append(
+                (
+                    f"OpenRouter {m}",
+                    "openrouter",
+                    m,
+                    lambda m=m: call_openai_compat(
+                        OPENROUTER_URL, os.environ["OPENROUTER_API_KEY"], m, prompt
+                    ),
+                )
+            )
+    for label, provider, model, fn in attempts:
         try:
             out = (fn() or "").strip()
             if out:
-                print(f"ИИ: {name} ответил")
+                print(f"ИИ: {label} ответил")
+                models = _MODELS[provider]  # рабочую модель ставим первой
+                if model in models:
+                    models.remove(model)
+                    models.insert(0, model)
                 return out
         except Exception as e:
-            status = getattr(getattr(e, "response", None), "status_code", "")
-            print(f"ИИ: {name} не сработал ({type(e).__name__} {status})")
+            print(f"ИИ: {label} не сработал ({type(e).__name__} {http_error_text(e)})")
     return None
 
 
