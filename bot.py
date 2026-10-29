@@ -9,6 +9,7 @@ import os
 import re
 import statistics
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -17,19 +18,31 @@ from bs4 import BeautifulSoup
 
 # ===================== НАСТРОЙКИ =====================
 CHANNEL = "@AlMaNewsToday"
-SOURCES = ["topor", "uranews", "theohdaily", "Dyadyabatya0"]  # username без @
+# username без @. Новые источники просто дописывайте в список.
+# Если канал не открывается или пуст, бот напишет об этом админу.
+SOURCES = [
+    "topor", "uranews", "theohdaily", "Dyadyabatya0",
+    "mash", "breakingmash", "bazabazon", "readovkanews", "rbc_news", "tass_agency",
+    "bloknot_rossiya", "bbbreaking", "pravdadirty",
+]
+HEADER_EMOJI = "⚡"           # смайлик в начале каждого поста; "" = без него
 SIGNATURE = "@AlMaNewsToday"  # подпись в конце поста; "" = без подписи
 USE_MEDIA = True              # брать все фото и видео из исходного поста
-MAX_AGE_DAY_HOURS = 1         # днём берём только посты не старше часа
-MAX_AGE_NIGHT_HOURS = 2       # ночью запуски реже, поэтому окно шире
+MAX_AGE_DAY_HOURS = 3         # окно свежести днём (запас на задержки cron; повторы режет seen)
+MAX_AGE_NIGHT_HOURS = 4       # ночью постов меньше, окно шире
 MIN_LENGTH = 80               # слишком короткие посты пропускаем
 DAY_FROM_HOUR = 8             # "день" по Москве: с 08:00 до 23:00
-DAY_TO_HOUR = 23              # (частоту запусков задаёт cron в news.yml)
-NIGHT_POSTS_PER_RUN = 2       # ночью запуск раз в час, поэтому можно 2 поста за раз
-DAILY_LIMIT = 60              # максимум постов в сутки
+DAY_TO_HOUR = 23
+DAY_POSTS_PER_RUN = 1         # постов за запуск днём (2, если очередь большая)
+NIGHT_POSTS_PER_RUN = 1       # постов за запуск ночью
+DAILY_LIMIT = 80              # максимум постов в сутки
 RECENT_FOR_AI = 15            # сколько последних постов показывать ИИ для проверки повторов
-MIN_SCORE = 6                 # новости с оценкой ИИ ниже этого (шкала 1-10) не публикуем
-POOL_SIZE = 12                # сколько свежих постов оценивать за раз
+MIN_SCORE = 5                 # новости с оценкой ИИ ниже этого (шкала 1-10) не публикуем
+POOL_SIZE = 20                # сколько свежих постов оценивать за раз
+DUP_THRESHOLD = 0.6           # доля общих слов, после которой пост считается повтором
+MAX_PUBLISH_FAILS = 3         # после стольких неудачных публикаций пост бросаем
+SOURCE_DEAD_RUNS = 12         # столько запусков подряд источник пуст -> алерт (12 = ~3 часа)
+IDLE_ALERT_HOURS = 6          # днём нет публикаций столько часов -> алерт
 # Что считать интересным. Это текст для ИИ, правьте его под свой канал:
 INTEREST_CRITERIA = (
     "Аудитория канала читает российские новости. Выше оценивай: громкие и важные "
@@ -95,32 +108,55 @@ PROMPT = """Ты редактор новостного канала. Переп�
 
 # ---------------------- состояние ----------------------
 def load_state():
+    """Нет файла -> пустое состояние. Файл есть, но битый -> остановка:
+    пустое состояние обнулило бы seen и бот опубликовал бы старое повторно."""
+    if not os.path.exists(STATE_FILE):
+        return {}
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("state.json не объект")
+        return data
+    except Exception as e:
+        alert(f"state.json повреждён ({e}), бот остановлен, чтобы не дублировать посты")
+        sys.exit(1)
 
 
 def save_state(state):
-    state["seen"] = state.get("seen", [])[-3000:]
-    state["recent"] = state.get("recent", [])[-40:]
-    state["posts"] = state.get("posts", [])[-30:]
+    state["seen"] = state.get("seen", [])[-4000:]
+    state["recent"] = state.get("recent", [])[-60:]
+    state["posts"] = state.get("posts", [])[-40:]
     scores = state.get("scores", {})
-    if len(scores) > 300:
-        state["scores"] = dict(list(scores.items())[-300:])
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    if len(scores) > 400:
+        state["scores"] = dict(list(scores.items())[-400:])
+    fails = state.get("fails", {})
+    if len(fails) > 200:
+        state["fails"] = dict(list(fails.items())[-200:])
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp, STATE_FILE)  # запись целиком или никак
 
 
 # ---------------------- Telegram ----------------------
 def tg(method, files=None, **data):
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-        data=data,
-        files=files,
-        timeout=180,
-    )
+    r = None
+    for _ in range(3):
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            data=data,
+            files=files,
+            timeout=180,
+        )
+        if r.status_code == 429:  # слишком часто: ждём, сколько просит Telegram
+            try:
+                wait = r.json().get("parameters", {}).get("retry_after", 5)
+            except ValueError:
+                wait = 5
+            time.sleep(min(int(wait) + 1, 30))
+            continue
+        break
     if not r.ok:
         raise RuntimeError(f"Telegram {method}: {r.status_code} {r.text[:200]}")
 
@@ -128,7 +164,7 @@ def tg(method, files=None, **data):
 def alert(message):
     """Сообщение администратору (если задан секрет ADMIN_CHAT_ID)."""
     print("ALERT:", message)
-    if ADMIN_CHAT_ID:
+    if ADMIN_CHAT_ID and BOT_TOKEN:
         try:
             tg("sendMessage", chat_id=ADMIN_CHAT_ID, text=f"Бот канала: {message}")
         except Exception as e:
@@ -179,7 +215,8 @@ def send_media(media, caption, upload):
 
 
 def publish(text, media):
-    final = text + (f"\n\n{SIGNATURE}" if SIGNATURE else "")
+    head = f"{HEADER_EMOJI} " if HEADER_EMOJI else ""
+    final = head + text + (f"\n\n{SIGNATURE}" if SIGNATURE else "")
     media = media[:10] if USE_MEDIA else []
     if media:
         caption = final if len(final) <= 1024 else None  # лимит подписи в Telegram
@@ -201,10 +238,22 @@ def publish(text, media):
 
 
 # ---------------------- сбор постов ----------------------
+def get_page(name):
+    """Страница канала с тремя попытками: t.me иногда отвечает ошибкой или тормозит."""
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get(f"https://t.me/s/{name}", headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise last
+
+
 def fetch_source(name):
-    r = requests.get(f"https://t.me/s/{name}", headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(get_page(name), "html.parser")
     posts = []
     for w in soup.select("div.tgme_widget_message"):
         post_id = w.get("data-post")
@@ -233,11 +282,15 @@ def fetch_source(name):
         v_el = w.select_one("span.tgme_widget_message_views")
         if v_el:
             views = parse_views(v_el.get_text())
+        try:
+            date = datetime.fromisoformat(time_el["datetime"])
+        except ValueError:
+            continue
         posts.append(
             {
                 "id": post_id,
                 "text": text_el.get_text().strip(),
-                "date": datetime.fromisoformat(time_el["datetime"]),
+                "date": date,
                 "media": media[:10],
                 "views": views,
                 "big_video": big_video,
@@ -291,16 +344,17 @@ def is_ad(text):
 
 
 def words(text):
-    return {w for w in re.findall(r"\w+", text.lower()) if len(w) >= 5}
+    """Значимые слова, обрезанные до 6 букв (чтобы 'убили' и 'убит' считались одним словом)."""
+    return {w[:6] for w in re.findall(r"\w+", text.lower()) if len(w) >= 5}
 
 
 def is_duplicate(text, state):
     a = words(text)
-    if not a:
+    if len(a) < 6:
         return False
     for prev in state.get("recent", []):
         b = set(prev)
-        if b and len(a & b) / min(len(a), len(b)) > 0.5:
+        if len(b) >= 6 and len(a & b) / min(len(a), len(b)) > DUP_THRESHOLD:
             return True
     return False
 
@@ -567,6 +621,7 @@ def main():
     if state.get("day") != today:
         state["day"] = today
         state["count"] = 0
+    state.setdefault("count", 0)
     if state["count"] >= DAILY_LIMIT:
         print("Дневной лимит достигнут")
         save_state(state)
@@ -576,12 +631,33 @@ def main():
     state.setdefault("recent", [])
     state.setdefault("posts", [])
     state.setdefault("scores", {})
+    state.setdefault("fails", {})       # id -> число неудачных публикаций
+    state.setdefault("src_dead", {})    # источник -> запусков подряд без постов
     seen = set(state["seen"])
+    stats_reason = {}                   # причина отсева -> сколько постов
 
-    def mark(post_id):
+    def mark(post_id, reason=None):
         if post_id not in seen:
             seen.add(post_id)
             state["seen"].append(post_id)
+        if reason:
+            stats_reason[reason] = stats_reason.get(reason, 0) + 1
+
+    # тишина: днём давно ничего не публиковалось
+    last_pub = state.get("last_pub")
+    if is_day and last_pub:
+        try:
+            idle = now - datetime.fromisoformat(last_pub)
+            last_idle_alert = state.get("last_idle_alert")
+            alert_gap_ok = (
+                not last_idle_alert
+                or now - datetime.fromisoformat(last_idle_alert) > timedelta(hours=IDLE_ALERT_HOURS)
+            )
+            if idle > timedelta(hours=IDLE_ALERT_HOURS) and alert_gap_ok:
+                alert(f"уже {int(idle.total_seconds() // 3600)} ч нет публикаций")
+                state["last_idle_alert"] = now.isoformat()
+        except ValueError:
+            pass
 
     max_age = MAX_AGE_DAY_HOURS if is_day else MAX_AGE_NIGHT_HOURS
     override = os.getenv("MAX_AGE_OVERRIDE", "").strip()
@@ -592,17 +668,30 @@ def main():
         except ValueError:
             pass
     print(f"Сейчас {msk:%H:%M} по Москве ({'день' if is_day else 'ночь'}), окно свежести {max_age} ч")
+
     candidates = []
     failed_sources = 0
-    for source in SOURCES:
+    for source in dict.fromkeys(SOURCES):  # без дублей, порядок сохраняется
         try:
             posts = fetch_source(source)
         except Exception as e:
             print(f"Источник {source} не открылся: {type(e).__name__}")
             failed_sources += 1
+            posts = []
+        # источник пуст или недоступен много запусков подряд -> один алерт на каждые N запусков
+        dead = state["src_dead"]
+        if posts:
+            dead[source] = 0
+        else:
+            dead[source] = dead.get(source, 0) + 1
+            if dead[source] % SOURCE_DEAD_RUNS == 0:
+                alert(f"источник {source} не отдаёт посты уже {dead[source]} запусков подряд "
+                      f"(проверьте имя канала и что у него открыт веб-просмотр t.me/s/{source})")
+        if not posts:
             continue
         stats = {"new": 0, "seen": 0, "old": 0}
         for p in posts:
+            p["source"] = source
             if p["id"] in seen:
                 stats["seen"] += 1
                 continue
@@ -618,7 +707,7 @@ def main():
             f"новых в окне {stats['new']}, уже обработано {stats['seen']}, старше окна {stats['old']}"
         )
 
-    if failed_sources == len(SOURCES):
+    if failed_sources == len(set(SOURCES)):
         alert("ни один источник не открылся")
     print(f"Кандидатов: {len(candidates)}")
 
@@ -636,7 +725,7 @@ def main():
             reason = "повтор уже опубликованного"
         if reason:
             print(f"{p['id']}: отсеян ({reason})")
-            mark(p["id"])
+            mark(p["id"], reason)
             continue
         p["clean"] = text
         pool.append(p)
@@ -662,7 +751,7 @@ def main():
         p["ai"] = cached.get(p["id"])
         if p["ai"] is not None and p["ai"] < MIN_SCORE:
             print(f"{p['id']}: оценка {p['ai']:g} ниже порога {MIN_SCORE}, пропускаю")
-            mark(p["id"])  # неинтересное больше не рассматриваем
+            mark(p["id"], "низкая оценка")  # неинтересное больше не рассматриваем
             continue
         base = p["ai"] if p["ai"] is not None else MIN_SCORE
         p["rank"] = base + views_bonus(p)
@@ -670,13 +759,22 @@ def main():
     ranked.sort(key=lambda p: p["rank"], reverse=True)  # при равенстве остаётся порядок "свежие первыми"
 
     # 3. рерайт и публикация лучших
-    per_run = (2 if len(ranked) > 15 else 1) if is_day else NIGHT_POSTS_PER_RUN
+    if is_day:
+        per_run = DAY_POSTS_PER_RUN + (1 if len(ranked) > 8 else 0)
+    else:
+        per_run = NIGHT_POSTS_PER_RUN
     published = 0
     had_error = False
 
     for p in ranked:
         if published >= per_run or state["count"] >= DAILY_LIMIT:
             break
+
+        # за этот же запуск мог выйти пост про то же событие из другого источника
+        if is_duplicate(p["clean"], state):
+            print(f"{p['id']}: повтор только что опубликованного")
+            mark(p["id"], "повтор в этом запуске")
+            continue
 
         new = rewrite(p["clean"], state["posts"][-RECENT_FOR_AI:])
         if new is None:
@@ -685,28 +783,37 @@ def main():
             break
         if new.upper().startswith(("SKIP", "DUPLICATE")):
             print(f"{p['id']}: пропущен ИИ ({new[:9]})")
-            mark(p["id"])
+            mark(p["id"], f"ИИ: {new[:9].upper().strip('. ')}")
             continue
         new = postprocess(new)
-        if len(new) < 40:
-            mark(p["id"])
+        if len(new) < 40 or len(new) > 2.5 * len(p["clean"]) + 200:
+            print(f"{p['id']}: ответ ИИ выглядит странно (длина {len(new)}), пропускаю")
+            mark(p["id"], "странный ответ ИИ")
             continue
 
         try:
             publish(new, p["media"])
         except Exception as e:
-            alert(f"не удалось опубликовать: {e}")
+            n = state["fails"].get(p["id"], 0) + 1
+            state["fails"][p["id"]] = n
+            alert(f"не удалось опубликовать {p['id']} (попытка {n}/{MAX_PUBLISH_FAILS}): {e}")
+            if n >= MAX_PUBLISH_FAILS:
+                mark(p["id"], "не публикуется")
             had_error = True
             break
 
         mark(p["id"])
         state["count"] += 1
-        state["recent"].append(sorted(words(new))[:80])
+        state["last_pub"] = now.isoformat()
+        state["recent"].append(sorted(words(new))[:200])
         state["posts"].append(new[:250].replace("\n", " "))
         published += 1
         print(f"Опубликован пост из {p['id']} (оценка {p['ai']}, просмотры {p['views']})")
-        save_state(state)
+        save_state(state)  # сразу, чтобы сбой дальше не привёл к повторной публикации
 
+    reasons = ", ".join(f"{k}: {v}" for k, v in stats_reason.items()) or "нет"
+    print(f"ИТОГ: опубликовано {published}, в очереди осталось {max(0, len(ranked) - published)}, "
+          f"отсеяно ({reasons}), за сутки {state['count']}/{DAILY_LIMIT}")
     save_state(state)
     if had_error:
         sys.exit(1)
