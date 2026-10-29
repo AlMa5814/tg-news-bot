@@ -7,6 +7,7 @@
 import json
 import os
 import re
+import statistics
 import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -27,6 +28,16 @@ DAY_TO_HOUR = 23              # (частоту запусков задаёт cr
 NIGHT_POSTS_PER_RUN = 2       # ночью запуск раз в час, поэтому можно 2 поста за раз
 DAILY_LIMIT = 60              # максимум постов в сутки
 RECENT_FOR_AI = 15            # сколько последних постов показывать ИИ для проверки повторов
+MIN_SCORE = 6                 # новости с оценкой ИИ ниже этого (шкала 1-10) не публикуем
+POOL_SIZE = 12                # сколько свежих постов оценивать за раз
+# Что считать интересным. Это текст для ИИ, правьте его под свой канал:
+INTEREST_CRITERIA = (
+    "Аудитория канала читает российские новости. Выше оценивай: громкие и важные "
+    "события в стране, скандалы, заявления и конфликты известных людей, новости про "
+    "блогеров, стримеров и шоу-бизнес, деньги, цены и законы, которые касаются многих. "
+    "Ниже оценивай: мелкие местные происшествия, сухие сводки, посты без конкретных "
+    "фактов, шутки, мемы и пересказы без новой информации."
+)
 
 GEMINI_MODEL = "gemini-2.5-flash"
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -95,6 +106,9 @@ def save_state(state):
     state["seen"] = state.get("seen", [])[-3000:]
     state["recent"] = state.get("recent", [])[-40:]
     state["posts"] = state.get("posts", [])[-30:]
+    scores = state.get("scores", {})
+    if len(scores) > 300:
+        state["scores"] = dict(list(scores.items())[-300:])
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
 
@@ -214,15 +228,49 @@ def fetch_source(name):
             "a.tgme_widget_message_video_wrap"
         ) and not any(x["type"] == "video" for x in media):
             print(f"{post_id}: видео слишком большое для веб-превью, пропускаю его")
+        views = None
+        v_el = w.select_one("span.tgme_widget_message_views")
+        if v_el:
+            views = parse_views(v_el.get_text())
         posts.append(
             {
                 "id": post_id,
                 "text": text_el.get_text().strip(),
                 "date": datetime.fromisoformat(time_el["datetime"]),
                 "media": media[:10],
+                "views": views,
             }
         )
+
+    # популярность поста относительно обычных просмотров этого канала
+    now_utc = datetime.now(timezone.utc)
+    old = [
+        p["views"]
+        for p in posts
+        if p["views"] and now_utc - p["date"] > timedelta(hours=3)
+    ]
+    base = statistics.median(old) if len(old) >= 3 else None
+    for p in posts:
+        p["rel"] = (p["views"] / base) if (base and p["views"]) else None
     return posts
+
+
+def parse_views(s):
+    """'1.2K' -> 1200, '3.4M' -> 3400000, '845' -> 845."""
+    m = re.match(r"([\d.]+)\s*([KkMm]?)", s.strip().replace(",", "."))
+    if not m:
+        return None
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return None
+    return int(num * {"k": 1e3, "m": 1e6}.get(m.group(2).lower(), 1))
+
+
+def views_bonus(p):
+    """Мягкая добавка к баллу за популярность: от 0 до +1."""
+    rel = p.get("rel")
+    return min(1.0, 2 * rel) if rel is not None else 0.0
 
 
 def clean(text):
@@ -404,6 +452,52 @@ def rewrite(text, recent_posts):
     """Пробует ИИ по очереди. Возвращает текст, "SKIP"/"DUPLICATE" или None, если все упали."""
     recent = "\n".join(f"- {t}" for t in recent_posts) or "(пока нет)"
     prompt = PROMPT.format(n=len(text), text=text, recent=recent)
+    return ask_ai(prompt)
+
+
+SCORE_PROMPT = """Ты главный редактор новостного канала. {criteria}
+Оцени каждую новость по шкале от 1 до 10: насколько она важна и интересна читателям \
+канала (10 = обязательно публиковать, 1 = совсем не нужна).
+Верни только JSON-объект: ключ это номер новости, значение это балл. \
+Пример: {"1": 7, "2": 3}
+
+Новости:
+"""
+
+
+def parse_scores(raw, n):
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except ValueError:
+        return None
+    out = {}
+    for k, v in data.items():
+        try:
+            i, s = int(k), float(v)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= i <= n:
+            out[i] = max(1.0, min(10.0, s))
+    return out or None
+
+
+def score_posts(items):
+    """Один запрос к ИИ: оценки сразу для всех постов. Возвращает {номер: балл} или None."""
+    lines = [
+        f"{i}. " + p["clean"][:300].replace("\n", " ") for i, p in enumerate(items, 1)
+    ]
+    prompt = SCORE_PROMPT.replace("{criteria}", INTEREST_CRITERIA) + "\n".join(lines)
+    raw = ask_ai(prompt)
+    if raw is None:
+        return None
+    return parse_scores(raw, len(items))
+
+
+def ask_ai(prompt):
+    """Пробует ИИ по очереди (Gemini, Groq, OpenRouter). Текст ответа или None, если все упали."""
     attempts = []  # (подпись, провайдер, модель, вызов)
     if os.getenv("GEMINI_API_KEY"):
         for m in get_models("gemini"):
@@ -479,6 +573,7 @@ def main():
     state.setdefault("seen", [])
     state.setdefault("recent", [])
     state.setdefault("posts", [])
+    state.setdefault("scores", {})
     seen = set(state["seen"])
 
     def mark(post_id):
@@ -507,20 +602,52 @@ def main():
         alert("ни один источник не открылся")
     print(f"Кандидатов: {len(candidates)}")
 
+    # 1. быстрые фильтры (длина, реклама, повторы по словам)
     candidates.sort(key=lambda p: p["date"], reverse=True)  # свежие первыми
-    per_run = (2 if len(candidates) > 15 else 1) if is_day else NIGHT_POSTS_PER_RUN
-    published = 0
-    had_error = False
-
+    pool = []
     for p in candidates:
-        if published >= per_run or state["count"] >= DAILY_LIMIT:
-            break
         text = clean(p["text"])
         if len(text) < MIN_LENGTH or is_ad(text) or is_duplicate(text, state):
             mark(p["id"])
             continue
+        p["clean"] = text
+        pool.append(p)
+    pool = pool[:POOL_SIZE]
 
-        new = rewrite(text, state["posts"][-RECENT_FOR_AI:])
+    # 2. оценка важности ИИ (один запрос на все новые посты, оценки запоминаются)
+    cached = state["scores"]
+    to_score = [p for p in pool if p["id"] not in cached]
+    if to_score:
+        scores = score_posts(to_score)
+        if scores is None:
+            print("Оценка ИИ недоступна, выбираю по свежести")
+        else:
+            for i, p in enumerate(to_score, 1):
+                if i in scores:
+                    cached[p["id"]] = scores[i]
+            print("Оценки: " + ", ".join(f"{p['id']}={cached.get(p['id'], '?')}" for p in to_score))
+
+    ranked = []
+    for p in pool:
+        p["ai"] = cached.get(p["id"])
+        if p["ai"] is not None and p["ai"] < MIN_SCORE:
+            mark(p["id"])  # неинтересное больше не рассматриваем
+            continue
+        base = p["ai"] if p["ai"] is not None else MIN_SCORE
+        p["rank"] = base + views_bonus(p)
+        ranked.append(p)
+    ranked.sort(key=lambda p: p["rank"], reverse=True)  # при равенстве остаётся порядок "свежие первыми"
+
+    # 3. рерайт и публикация лучших
+    per_run = (2 if len(ranked) > 15 else 1) if is_day else NIGHT_POSTS_PER_RUN
+    published = 0
+    had_error = False
+
+    for p in ranked:
+        if published >= per_run or state["count"] >= DAILY_LIMIT:
+            break
+
+        new = rewrite(p["clean"], state["posts"][-RECENT_FOR_AI:])
         if new is None:
             alert("все ИИ не ответили, повторю при следующем запуске")
             had_error = True
@@ -546,7 +673,7 @@ def main():
         state["recent"].append(sorted(words(new))[:80])
         state["posts"].append(new[:250].replace("\n", " "))
         published += 1
-        print(f"Опубликован пост из {p['id']}")
+        print(f"Опубликован пост из {p['id']} (оценка {p['ai']}, просмотры {p['views']})")
         save_state(state)
 
     save_state(state)
