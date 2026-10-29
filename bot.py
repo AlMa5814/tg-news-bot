@@ -30,12 +30,16 @@ SOURCES = [
 HEADER_EMOJI = "⚡"           # смайлик в начале каждого поста; "" = без него
 SIGNATURE = "@AlMaNewsToday"  # подпись в конце поста; "" = без подписи
 USE_MEDIA = True              # брать все фото и видео из исходного поста
+TEXT_ONLY_SHARE = 0.2         # доля постов без фото/видео среди последних публикаций (0.2 = примерно каждый пятый)
+MEDIA_HISTORY = 10            # по скольким последним публикациям считается эта доля
+TEXT_ONLY_PENALTY = 1.5       # на сколько баллов посты без медиа проигрывают в очереди
+TEXT_ONLY_IDLE_HOURS = 3      # если столько часов ничего не выходило, можно и без медиа
 MAX_AGE_DAY_HOURS = 3         # окно свежести днём (запас на задержки cron; повторы режет seen)
 MAX_AGE_NIGHT_HOURS = 4       # ночью постов меньше, окно шире
 MIN_LENGTH = 20               # слишком короткие посты пропускаем (защита от пустых и обрывков)
 DAY_FROM_HOUR = 8             # "день" по Москве: с 08:00 до 23:00
 DAY_TO_HOUR = 23
-QUEUE_SHARE = 0.25            # какую долю очереди публиковать за один запуск (0.25 = четверть)
+QUEUE_SHARE = 0.15            # какую долю очереди публиковать за один запуск (0.15 = 15%)
 MIN_POSTS_PER_RUN = 1         # но не меньше стольки (если очередь не пуста)
 MAX_POSTS_PER_RUN = 5         # и не больше стольки, чтобы не заспамить канал
 POST_PAUSE_MIN_SEC = 30       # пауза между постами в одном запуске: случайная
@@ -135,6 +139,7 @@ def save_state(state):
     scores = state.get("scores", {})
     if len(scores) > 400:
         state["scores"] = dict(list(scores.items())[-400:])
+    state["media_hist"] = state.get("media_hist", [])[-50:]
     fails = state.get("fails", {})
     if len(fails) > 200:
         state["fails"] = dict(list(fails.items())[-200:])
@@ -238,7 +243,8 @@ def publish(text, media):
             if caption is None:  # текст длиннее 1024 знаков идёт следом отдельным сообщением
                 tg("sendMessage", chat_id=CHANNEL, text=final, disable_web_page_preview="true")
             return
-        print("Публикую только текстом")
+        # пост с медиа не превращаем в текстовый: повторим при следующем запуске
+        raise RuntimeError("медиа не отправилось ни по ссылке, ни с загрузкой")
     tg("sendMessage", chat_id=CHANNEL, text=final, disable_web_page_preview="true")
 
 
@@ -341,6 +347,20 @@ def clean(text):
     text = re.sub(r"@\w+", "", text)
     text = EMOJI.sub("", text)
     return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+def text_only_allowed(state, now):
+    """Можно ли сейчас выложить пост без фото/видео: их доля среди последних публикаций ограничена."""
+    hist = state.get("media_hist", [])[-MEDIA_HISTORY:]
+    if (hist.count(0) + 1) / (len(hist) + 1) <= TEXT_ONLY_SHARE:
+        return True
+    last = state.get("last_pub")
+    if not last:
+        return True
+    try:
+        return now - datetime.fromisoformat(last) > timedelta(hours=TEXT_ONLY_IDLE_HOURS)
+    except ValueError:
+        return True
 
 
 def is_ad(text):
@@ -636,6 +656,7 @@ def main():
     state.setdefault("recent", [])
     state.setdefault("posts", [])
     state.setdefault("scores", {})
+    state.setdefault("media_hist", [])  # 1 = опубликован пост с медиа, 0 = без медиа
     state.setdefault("fails", {})       # id -> число неудачных публикаций
     state.setdefault("src_dead", {})    # источник -> запусков подряд без постов
     seen = set(state["seen"])
@@ -759,7 +780,7 @@ def main():
             mark(p["id"], "низкая оценка")  # неинтересное больше не рассматриваем
             continue
         base = p["ai"] if p["ai"] is not None else MIN_SCORE
-        p["rank"] = base + views_bonus(p)
+        p["rank"] = base + views_bonus(p) - (0 if p["media"] else TEXT_ONLY_PENALTY)
         ranked.append(p)
     ranked.sort(key=lambda p: p["rank"], reverse=True)  # при равенстве остаётся порядок "свежие первыми"
 
@@ -775,6 +796,10 @@ def main():
     for p in ranked:
         if published >= per_run or state["count"] >= DAILY_LIMIT:
             break
+        # пост без фото/видео выходит, только пока их доля в канале не превышена
+        if not p["media"] and not text_only_allowed(state, now):
+            print(f"{p['id']}: без медиа, лимит таких постов исчерпан, оставляю в очереди")
+            continue
         if published > 0:
             pause = random.uniform(POST_PAUSE_MIN_SEC, POST_PAUSE_MAX_SEC)
             print(f"Пауза {pause:.0f} с до следующего поста")
@@ -815,6 +840,7 @@ def main():
         mark(p["id"])
         state["count"] += 1
         state["last_pub"] = now.isoformat()
+        state["media_hist"].append(1 if p["media"] else 0)
         state["recent"].append(sorted(words(new))[:200])
         state["posts"].append(new[:250].replace("\n", " "))
         published += 1
