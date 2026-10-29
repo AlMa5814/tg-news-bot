@@ -401,6 +401,7 @@ OPENROUTER_PREF = ["gpt-oss-120b", "llama-3.3-70b", "qwen3", "deepseek", "gemma-
                    "mistral", "llama", "gemma"]
 
 _MODELS = {}
+_DEAD = set()  # провайдеры, у которых в этом запуске кончилась квота или не принят ключ
 
 
 def http_error_text(e):
@@ -488,6 +489,81 @@ LISTERS = {
     "groq": (list_groq_models, lambda: [GROQ_MODEL]),
     "openrouter": (list_openrouter_models, lambda: list(OPENROUTER_MODELS)),
 }
+
+
+# Дополнительные провайдеры с OpenAI-совместимым API. Включаются сами, если задан секрет с ключом.
+# Чтобы добавить ещё одного, достаточно дописать блок в этот словарь.
+EXTRA_PROVIDERS = {
+    "cerebras": {
+        "env": "CEREBRAS_API_KEY",
+        "base": "https://api.cerebras.ai/v1",
+        "fallback": ["gpt-oss-120b", "llama-3.3-70b"],
+        "pref": ["gpt-oss-120b", "llama-3.3-70b", "qwen", "llama"],
+        "bad": ["embed", "whisper", "guard"],
+    },
+    "mistral": {
+        "env": "MISTRAL_API_KEY",
+        "base": "https://api.mistral.ai/v1",
+        "fallback": ["mistral-small-latest"],
+        "pref": ["mistral-small", "mistral-medium", "open-mistral", "mistral-large", "ministral"],
+        "bad": ["embed", "moderation", "ocr", "codestral", "voxtral", "pixtral", "devstral", "magistral"],
+    },
+    "sambanova": {
+        "env": "SAMBANOVA_API_KEY",
+        "base": "https://api.sambanova.ai/v1",
+        "fallback": ["Meta-Llama-3.3-70B-Instruct"],
+        "pref": ["gpt-oss-120b", "llama-3.3-70b", "deepseek", "qwen", "llama"],
+        "bad": ["embed", "whisper", "guard", "vision", "audio"],
+    },
+    "nvidia": {  # build.nvidia.com, бесплатный ключ nvapi-...
+        "env": "NVIDIA_API_KEY",
+        "base": "https://integrate.api.nvidia.com/v1",
+        "fallback": ["meta/llama-3.3-70b-instruct", "openai/gpt-oss-120b"],
+        "pref": ["llama-3.3-70b", "gpt-oss-120b", "llama-3.1-70b", "qwen", "mistral", "llama"],
+        "bad": ["embed", "rerank", "vision", "vila", "neva", "fuyu", "paligemma", "kosmos",
+                "clip", "guard", "safety", "reward", "retriev", "parakeet", "riva", "nemoguard",
+                "ocr", "nv-", "-vl", "deplot", "bge", "arctic-embed"],
+    },
+    "github": {  # GitHub Models; токен выдаёт сам GitHub Actions, регистрироваться не нужно
+        "env": "GITHUB_MODELS_TOKEN",
+        "base": "https://models.github.ai/inference",
+        "fallback": ["openai/gpt-4.1-mini", "openai/gpt-4o-mini"],
+        "pref": ["gpt-4.1-mini", "gpt-4o-mini", "llama-3.3-70b", "mistral"],
+        "bad": ["embed", "o1", "o3", "o4"],
+    },
+    "cohere": {  # пробный ключ, лимиты небольшие, поэтому в самом конце цепочки
+        "env": "COHERE_API_KEY",
+        "base": "https://api.cohere.ai/compatibility/v1",
+        "fallback": ["command-a-03-2025", "command-r-plus-08-2024"],
+        "pref": ["command-a", "command-r-plus", "command-r"],
+        "bad": ["embed", "rerank", "vision", "reasoning", "translate", "arabic"],
+    },
+}
+
+
+def make_extra_lister(name):
+    cfg = EXTRA_PROVIDERS[name]
+
+    def lister():
+        r = requests.get(
+            f"{cfg['base']}/models",
+            headers={"Authorization": f"Bearer {os.environ[cfg['env']]}"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        ids = [
+            m["id"]
+            for m in r.json().get("data", [])
+            if m.get("id") and not any(b in m["id"].lower() for b in cfg["bad"])
+        ]
+        ids.sort(key=lambda n: pref_index(n, cfg["pref"]))
+        return ids[:3]
+
+    return lister
+
+
+for _name, _cfg in EXTRA_PROVIDERS.items():
+    LISTERS[_name] = (make_extra_lister(_name), lambda c=_cfg: list(c["fallback"]))
 
 
 def get_models(provider):
@@ -595,6 +671,20 @@ def ask_ai(prompt):
                     ),
                 )
             )
+    for name, cfg in EXTRA_PROVIDERS.items():
+        if not os.getenv(cfg["env"]):
+            continue
+        for m in get_models(name):
+            attempts.append(
+                (
+                    f"{name} {m}",
+                    name,
+                    m,
+                    lambda m=m, cfg=cfg: call_openai_compat(
+                        f"{cfg['base']}/chat/completions", os.environ[cfg["env"]], m, prompt
+                    ),
+                )
+            )
     if os.getenv("OPENROUTER_API_KEY"):
         for m in get_models("openrouter"):
             attempts.append(
@@ -608,6 +698,8 @@ def ask_ai(prompt):
                 )
             )
     for label, provider, model, fn in attempts:
+        if provider in _DEAD:
+            continue
         try:
             out = (fn() or "").strip()
             if out:
@@ -619,6 +711,10 @@ def ask_ai(prompt):
                 return out
         except Exception as e:
             print(f"ИИ: {label} не сработал ({type(e).__name__} {http_error_text(e)})")
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (401, 402, 403, 429):  # ключ/квота: остальные модели этого провайдера пропускаем
+                _DEAD.add(provider)
+                print(f"ИИ: {provider} до конца запуска пропускаю")
     return None
 
 
