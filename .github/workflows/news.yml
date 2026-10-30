@@ -9,6 +9,10 @@ on:
       max_age_hours:
         description: "Для теста: брать посты за последние N часов (например 24). Пусто = обычный режим"
         required: false
+  push:
+    # Cloudflare Worker кладёт каждое нажатие кнопки файлом в inbox/, это запускает быструю обработку
+    branches: [main]
+    paths: ["inbox/**"]
 
 permissions:
   contents: write
@@ -24,6 +28,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # всегда свежая вершина main на момент старта задачи: запуск, простоявший в очереди,
+          # иначе взял бы устаревший state.json и мог бы опубликовать то же самое повторно
+          ref: main
 
       - uses: actions/setup-python@v5
         with:
@@ -46,6 +54,7 @@ jobs:
           GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           MAX_AGE_OVERRIDE: ${{ github.event.inputs.max_age_hours }}
+          RUN_MODE: ${{ github.event_name == 'push' && 'moderation' || '' }}
         run: python bot.py
 
       - name: Save state
@@ -54,6 +63,7 @@ jobs:
           git config user.name "news-bot"
           git config user.email "bot@users.noreply.github.com"
           if [ -f state.json ]; then git add state.json; fi
+          git add -A inbox 2>/dev/null || true   # обработанные нажатия удаляются из папки
           if ! git diff --cached --quiet; then
             git commit -m "update state"
             for i in 1 2 3; do
