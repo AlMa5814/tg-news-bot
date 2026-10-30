@@ -44,6 +44,15 @@ MIN_POSTS_PER_RUN = 1         # но не меньше стольки (если 
 MAX_POSTS_PER_RUN = 5         # и не больше стольки, чтобы не заспамить канал
 POST_PAUSE_MIN_SEC = 30       # пауза между постами в одном запуске: случайная
 POST_PAUSE_MAX_SEC = 90       # от 30 секунд до 1,5 минуты
+# --- ручная модерация: бот присылает пост тебе в личку (ADMIN_CHAT_ID) с кнопками ---
+MODERATION = True             # режим по умолчанию: True = ручная, False = автопубликация.
+                              # На ходу переключается командами /manual и /auto в личке с ботом
+MANUAL_QUEUE_SHARE = 0.5      # ручной режим: какую долю очереди присылать на одобрение за запуск (0.5 = 50%)
+MANUAL_IDLE_HOURS = 2         # нет твоих нажатий и сообщений столько часов -> бот сам публикует, как в авто (QUEUE_SHARE)
+AUTO_RELEASE_PER_RUN = 1      # в авто-режиме: сколько неодобренных постов из очереди модерации выпускать за запуск
+MODERATE_AT_NIGHT = True      # False = ночью (23:00-08:00 МСК) посты выходят сами, без одобрения
+MAX_PENDING = 8               # сколько постов может одновременно ждать твоего решения
+PENDING_TTL_HOURS = 6         # неодобренный пост через столько часов считается устаревшим и снимается
 DAILY_LIMIT = 80              # максимум постов в сутки
 RECENT_FOR_AI = 15            # сколько последних постов показывать ИИ для проверки повторов
 MIN_SCORE = 5                 # новости с оценкой ИИ ниже этого (шкала 1-10) не публикуем
@@ -169,6 +178,10 @@ def tg(method, files=None, **data):
         break
     if not r.ok:
         raise RuntimeError(f"Telegram {method}: {r.status_code} {r.text[:200]}")
+    try:
+        return r.json().get("result")
+    except ValueError:
+        return None
 
 
 def alert(message):
@@ -246,6 +259,316 @@ def publish(text, media):
         # пост с медиа не превращаем в текстовый: повторим при следующем запуске
         raise RuntimeError("медиа не отправилось ни по ссылке, ни с загрузкой")
     tg("sendMessage", chat_id=CHANNEL, text=final, disable_web_page_preview="true")
+
+
+# ---------------------- ручная модерация ----------------------
+# Как это работает. Бот живёт в GitHub Actions и не умеет ждать нажатий, поэтому:
+#  1) готовый пост уходит тебе в личку с кнопками и запоминается в state["pending"];
+#  2) при каждом следующем запуске бот забирает твои нажатия и ответы (getUpdates)
+#     и сразу выполняет их: публикует, отклоняет, переключает медиа.
+# Задержка между нажатием и публикацией: до одного интервала запуска (до 15 минут).
+def mod_media_summary(media):
+    photos = sum(1 for m in media if m["type"] == "photo")
+    videos = sum(1 for m in media if m["type"] == "video")
+    parts = []
+    if photos:
+        parts.append(f"{photos} фото")
+    if videos:
+        parts.append(f"{videos} видео")
+    return ", ".join(parts) or "нет"
+
+
+def mod_buttons(pid, item):
+    rows = [[
+        {"text": "✅ Опубликовать", "callback_data": f"ok:{pid}"},
+        {"text": "❌ Отклонить", "callback_data": f"no:{pid}"},
+    ]]
+    if item.get("media"):
+        on = "вкл" if item.get("media_on", True) else "выкл"
+        rows.append([{"text": f"🖼 Медиа: {on} (нажми, чтобы переключить)", "callback_data": f"md:{pid}"}])
+    return json.dumps({"inline_keyboard": rows})
+
+
+def mod_preview(item):
+    body = item["text"]
+    if len(body) > 3200:
+        body = body[:3200] + "…"
+    head = f"{HEADER_EMOJI} " if HEADER_EMOJI else ""
+    score = item.get("ai")
+    return (
+        f"На модерацию · {item['source']} · оценка {score if score is not None else '?'}\n"
+        f"Медиа: {mod_media_summary(item['media'])}\n"
+        f"Оригинал: https://t.me/{item['src_id']}\n\n"
+        f"{head}{body}\n\n"
+        "Ответом на это сообщение можно заменить текст или фото. "
+        "Пост с твоей правкой выйдет сразу."
+    )
+
+
+def mod_close(item, label):
+    """Убирает кнопки и подписывает итог под превью."""
+    try:
+        tg(
+            "editMessageText",
+            chat_id=ADMIN_CHAT_ID,
+            message_id=item["msg_id"],
+            text=f"{label}\n\n{item['text'][:300]}",
+            disable_web_page_preview="true",
+        )
+    except Exception as e:
+        print(f"Не удалось обновить сообщение модерации: {e}")
+
+
+def send_for_moderation(state, now, p, text):
+    state["pend_seq"] = state.get("pend_seq", 0) + 1
+    pid = f"p{state['pend_seq']}"
+    item = {
+        "text": text,
+        "media": (p["media"][:10] if USE_MEDIA else []),
+        "media_on": True,
+        "source": p["id"].split("/")[0],
+        "src_id": p["id"],
+        "ai": p.get("ai"),
+        "created": now.isoformat(),
+        "msg_id": None,
+    }
+    res = tg(
+        "sendMessage",
+        chat_id=ADMIN_CHAT_ID,
+        text=mod_preview(item),
+        reply_markup=mod_buttons(pid, item),
+        disable_web_page_preview="true",
+    )
+    if not res or "message_id" not in res:
+        raise RuntimeError("Telegram не вернул номер сообщения")
+    item["msg_id"] = res["message_id"]
+    state["pending"][pid] = item
+    return pid
+
+
+def effective_moderate(state, now, is_day):
+    """Нужно ли сейчас присылать посты на одобрение. Возвращает (да/нет, вид, пояснение).
+    Вид: manual | auto | night | idle | noadmin."""
+    mode = state.get("mode") or ("manual" if MODERATION else "auto")
+    if not ADMIN_CHAT_ID:
+        return False, "noadmin", "не задан ADMIN_CHAT_ID, модерация невозможна"
+    if mode != "manual":
+        return False, "auto", "включена автопубликация"
+    if not (is_day or MODERATE_AT_NIGHT):
+        return False, "night", "ночью без модерации"
+    try:
+        idle = now - datetime.fromisoformat(state["last_admin"])
+    except (KeyError, ValueError):
+        idle = timedelta(0)
+    if idle > timedelta(hours=MANUAL_IDLE_HOURS):
+        return False, "idle", f"нет активности {int(idle.total_seconds() // 3600)} ч"
+    return True, "manual", ""
+
+
+def handle_command(state, text, now, is_day):
+    """Команды админа: /manual, /auto, /status."""
+    cmd = text.split()[0].split("@")[0].lower()
+    if cmd == "/auto":
+        state["mode"] = "auto"
+        reply = "Режим: автопубликация. Бот сам выкладывает лучшие посты. Вернуть ручную модерацию: /manual"
+    elif cmd == "/manual":
+        state["mode"] = "manual"
+        reply = (
+            "Режим: ручная модерация. Посты приходят сюда с кнопками. "
+            f"Если ты ничего не нажмёшь и не напишешь {MANUAL_IDLE_HOURS} ч, бот временно перейдёт на автопубликацию. "
+            "Любое твоё действие вернёт ручной режим. Автопубликация насовсем: /auto"
+        )
+    elif cmd in ("/status", "/start", "/help"):
+        mode = state.get("mode") or ("manual" if MODERATION else "auto")
+        moderate, _, why = effective_moderate(state, now, is_day)
+        waiting = sum(1 for v in state["pending"].values() if not v.get("decision"))
+        reply = (
+            f"Режим: {'ручная модерация' if mode == 'manual' else 'автопубликация'}\n"
+            f"Сейчас работает: {'ручная модерация' if moderate else 'автопубликация (' + why + ')'}\n"
+            f"Ждут твоего решения: {waiting}\n"
+            f"Опубликовано сегодня: {state.get('count', 0)}/{DAILY_LIMIT}\n\n"
+            "Команды: /manual (ручная модерация), /auto (автопубликация), /status. "
+            "Команды выполняются при ближайшем запуске бота, это до 15 минут."
+        )
+    else:
+        return
+    try:
+        tg("sendMessage", chat_id=ADMIN_CHAT_ID, text=reply)
+    except Exception as e:
+        print(f"Не удалось ответить на команду: {e}")
+
+
+def handle_update(state, u, now, is_day):
+    """Одно обновление от Telegram: нажатие кнопки, команда или ответ на превью. Чужих игнорируем."""
+    pend = state["pending"]
+    cq = u.get("callback_query")
+    if cq:
+        # свой: личка админа (id человека == id чата) или общая группа модерации (id чата == ADMIN_CHAT_ID)
+        cq_chat = (cq.get("message") or {}).get("chat", {}).get("id")
+        if str(cq.get("from", {}).get("id")) != str(ADMIN_CHAT_ID) and str(cq_chat) != str(ADMIN_CHAT_ID):
+            return
+        state["last_admin"] = now.isoformat()
+        action, _, pid = (cq.get("data") or "").partition(":")
+        item = pend.get(pid)
+        note = ""
+        if not item:
+            note = "Пост уже обработан или устарел"
+        elif action == "ok":
+            item["decision"] = "ok"
+            note = "Принято, публикую"
+        elif action == "no":
+            item["decision"] = "no"
+            note = "Отклонено"
+        elif action == "md":
+            item["media_on"] = not item.get("media_on", True)
+            note = "Медиа включены" if item["media_on"] else "Медиа выключены"
+            try:
+                tg(
+                    "editMessageReplyMarkup",
+                    chat_id=ADMIN_CHAT_ID,
+                    message_id=item["msg_id"],
+                    reply_markup=mod_buttons(pid, item),
+                )
+            except Exception as e:
+                print(f"Не удалось обновить кнопки: {e}")
+        try:
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text=note)
+        except Exception:
+            pass  # старые нажатия Telegram уже не даёт подтвердить, это не страшно
+        return
+
+    msg = u.get("message")
+    if not msg:
+        return
+    text = (msg.get("text") or "").strip()
+    chat_id = msg.get("chat", {}).get("id")
+    if text.startswith("/") and text.split()[0].split("@")[0].lower() == "/id":
+        # подсказка для настройки: любой чат, где написали /id, узнаёт свой номер
+        try:
+            tg("sendMessage", chat_id=chat_id, text=f"ID этого чата: {chat_id}")
+        except Exception as e:
+            print(f"Не удалось ответить на /id: {e}")
+        return
+    if str(chat_id) != str(ADMIN_CHAT_ID):
+        return
+    state["last_admin"] = now.isoformat()  # любое сообщение модератора считается активностью
+    if text.startswith("/"):
+        handle_command(state, text, now, is_day)
+        return
+    reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+    if not reply_to:
+        return
+    pid = next((k for k, v in pend.items() if v.get("msg_id") == reply_to), None)
+    if not pid:
+        return
+    item = pend[pid]
+    new_text = (msg.get("text") or msg.get("caption") or "").strip()
+    if HEADER_EMOJI and new_text.startswith(HEADER_EMOJI):
+        new_text = new_text[len(HEADER_EMOJI):].strip()  # молнию бот добавит сам
+    changed = False
+    if msg.get("photo"):
+        item["media"] = [{"type": "photo", "url": msg["photo"][-1]["file_id"]}]
+        item["media_on"] = True
+        changed = True
+    elif msg.get("video"):
+        item["media"] = [{"type": "video", "url": msg["video"]["file_id"]}]
+        item["media_on"] = True
+        changed = True
+    if new_text:
+        item["text"] = new_text[:3500]
+        changed = True
+    if changed:
+        item["decision"] = "ok"
+        print(f"{pid}: админ заменил текст/медиа, публикую")
+
+
+def moderation_step(state, now, is_day):
+    """Забирает нажатия, команды и ответы, публикует одобренное, снимает отклонённое и устаревшее.
+    Возвращает (были ли ошибки публикации, нужна ли сейчас модерация, вид режима, пояснение)."""
+    had_error = False
+    updates = []
+    if ADMIN_CHAT_ID:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                data={
+                    "offset": state.get("tg_offset", 0),
+                    "timeout": 0,
+                    "allowed_updates": json.dumps(["callback_query", "message"]),
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            updates = r.json().get("result", [])
+        except Exception as e:  # текст ошибки requests содержит адрес с токеном, его не печатаем
+            code = getattr(getattr(e, "response", None), "status_code", "")
+            print(f"Нажатия не получены ({type(e).__name__} {code}). Если 409: у бота включён webhook, его надо снять")
+    for u in updates:
+        state["tg_offset"] = u["update_id"] + 1
+        try:
+            handle_update(state, u, now, is_day)
+        except Exception as e:
+            print(f"Обновление {u.get('update_id')} не разобрано: {type(e).__name__}")
+    if updates:
+        print(f"Модерация: получено обновлений {len(updates)}")
+
+    moderate, kind, why = effective_moderate(state, now, is_day)  # после обработки команд
+
+    # 1. устаревшие без решения снимаем
+    for pid, item in list(state["pending"].items()):
+        if item.get("decision"):
+            continue
+        try:
+            age = now - datetime.fromisoformat(item["created"])
+        except (KeyError, ValueError):
+            age = timedelta(0)
+        if age > timedelta(hours=PENDING_TTL_HOURS):
+            mod_close(item, "⌛ Устарело, снято без публикации")
+            del state["pending"][pid]
+            print(f"{pid}: устарел ({int(age.total_seconds() // 3600)} ч), снят")
+
+    # 2. без модерации (авто, ночь, молчание админа) самые старые неодобренные посты выпускаем сами
+    if not moderate:
+        waiting = sorted(
+            (kv for kv in state["pending"].items() if not kv[1].get("decision")),
+            key=lambda kv: kv[1].get("created", ""),
+        )
+        for pid, item in waiting[:AUTO_RELEASE_PER_RUN]:
+            item["decision"] = "ok"
+            print(f"{pid}: публикую без одобрения ({why})")
+
+    # 3. исполняем решения
+    done = 0
+    for pid, item in list(state["pending"].items()):
+        decision = item.get("decision")
+        if decision == "no":
+            mod_close(item, "❌ Отклонено")
+            del state["pending"][pid]
+        elif decision == "ok":
+            if done > 0:
+                time.sleep(random.uniform(POST_PAUSE_MIN_SEC, POST_PAUSE_MAX_SEC))
+            media = item["media"] if item.get("media_on", True) else []
+            try:
+                publish(item["text"], media)
+            except Exception as e:
+                n = item.get("fails", 0) + 1
+                item["fails"] = n
+                alert(f"не удалось опубликовать пост {pid} (попытка {n}/{MAX_PUBLISH_FAILS}): {e}")
+                if n >= MAX_PUBLISH_FAILS:
+                    mod_close(item, "⚠️ Не удалось опубликовать")
+                    del state["pending"][pid]
+                had_error = True
+                continue  # при n < MAX остаётся решение "ok": повторим при следующем запуске
+            done += 1
+            state["count"] = state.get("count", 0) + 1
+            state["last_pub"] = now.isoformat()
+            state["media_hist"].append(1 if media else 0)
+            state["posts"].append(item["text"][:250].replace("\n", " "))
+            mod_close(item, "✅ Опубликовано" if moderate else "✅ Опубликовано (без одобрения)")
+            del state["pending"][pid]
+            print(f"Опубликован пост {pid} из {item['src_id']}")
+            save_state(state)  # сразу, чтобы сбой дальше не привёл к повторной публикации
+    return had_error, moderate, kind, why
 
 
 # ---------------------- сбор постов ----------------------
@@ -743,7 +1066,24 @@ def main():
         state["day"] = today
         state["count"] = 0
     state.setdefault("count", 0)
-    if state["count"] >= DAILY_LIMIT:
+    state.setdefault("pending", {})     # посты, ожидающие решения админа
+    state.setdefault("media_hist", [])
+    state.setdefault("posts", [])
+    mode = state.get("mode") or ("manual" if MODERATION else "auto")
+    if mode == "manual" and not ADMIN_CHAT_ID:
+        sys.exit("Включена ручная модерация, но не задан секрет ADMIN_CHAT_ID: некому присылать посты")
+    # нажатия, команды и ответы обрабатываем всегда (и ночью, и при достигнутом лимите),
+    # moderate = присылать ли сейчас новые посты тебе на одобрение, а не публиковать самому
+    mod_error, moderate, kind, why = moderation_step(state, now, is_day)
+    print(f"Режим: {kind}{' (' + why + ')' if why else ''}")
+    # при уходе в автопубликацию из-за молчания предупреждаем один раз, чтобы это не было сюрпризом
+    if kind == "idle" and not state.get("idle_notified"):
+        state["idle_notified"] = True
+        alert(f"тебя не было на связи, перехожу на автопубликацию ({why}). "
+              "Любое твоё сообщение или нажатие вернёт ручную модерацию.")
+    elif kind != "idle":
+        state["idle_notified"] = False
+    if state["count"] >= DAILY_LIMIT and not moderate:  # одобрение вручную лимитом не блокируется
         print("Дневной лимит достигнут")
         save_state(state)
         return
@@ -871,32 +1211,39 @@ def main():
     ranked = []
     for p in pool:
         p["ai"] = cached.get(p["id"])
-        if p["ai"] is not None and p["ai"] < MIN_SCORE:
+        # в ручном режиме решаешь ты: оценка ИИ нужна только для порядка и показывается в превью
+        if not moderate and p["ai"] is not None and p["ai"] < MIN_SCORE:
             print(f"{p['id']}: оценка {p['ai']:g} ниже порога {MIN_SCORE}, пропускаю")
             mark(p["id"], "низкая оценка")  # неинтересное больше не рассматриваем
             continue
         base = p["ai"] if p["ai"] is not None else MIN_SCORE
-        p["rank"] = base + views_bonus(p) - (0 if p["media"] else TEXT_ONLY_PENALTY)
+        p["rank"] = base + views_bonus(p) - (0 if (p["media"] or moderate) else TEXT_ONLY_PENALTY)
         ranked.append(p)
     ranked.sort(key=lambda p: p["rank"], reverse=True)  # при равенстве остаётся порядок "свежие первыми"
 
     # 3. рерайт и публикация лучших
     # сколько публиковать за запуск: доля очереди, но в пределах [MIN, MAX]
     per_run = 0
-    if ranked:
+    if moderate:
+        # ручной режим: больше постов (MANUAL_QUEUE_SHARE), но не больше свободных мест в очереди модерации
+        if ranked:
+            per_run = max(MIN_POSTS_PER_RUN, math.ceil(len(ranked) * MANUAL_QUEUE_SHARE))
+        per_run = min(per_run, max(0, MAX_PENDING - len(state["pending"])))
+    elif ranked:
         per_run = max(MIN_POSTS_PER_RUN, min(MAX_POSTS_PER_RUN, math.ceil(len(ranked) * QUEUE_SHARE)))
-    print(f"В очереди {len(ranked)}, публикую за запуск до {per_run}")
+    action = "отправляю на модерацию" if moderate else "публикую"
+    print(f"В очереди {len(ranked)}, {action} за запуск до {per_run} (ждут решения: {len(state['pending'])})")
     published = 0
     had_error = False
 
     for p in ranked:
-        if published >= per_run or state["count"] >= DAILY_LIMIT:
+        if published >= per_run or (not moderate and state["count"] >= DAILY_LIMIT):
             break
-        # пост без фото/видео выходит, только пока их доля в канале не превышена
-        if not p["media"] and not text_only_allowed(state, now):
+        # пост без фото/видео выходит, только пока их доля в канале не превышена (в ручном режиме решаешь ты)
+        if not moderate and not p["media"] and not text_only_allowed(state, now):
             print(f"{p['id']}: без медиа, лимит таких постов исчерпан, оставляю в очереди")
             continue
-        if published > 0:
+        if published > 0 and not moderate:
             pause = random.uniform(POST_PAUSE_MIN_SEC, POST_PAUSE_MAX_SEC)
             print(f"Пауза {pause:.0f} с до следующего поста")
             time.sleep(pause)
@@ -922,6 +1269,21 @@ def main():
             mark(p["id"], "странный ответ ИИ")
             continue
 
+        if moderate:
+            try:
+                pid = send_for_moderation(state, now, p, new)
+            except Exception as e:
+                alert(f"не удалось отправить пост {p['id']} на модерацию: {e}")
+                had_error = True
+                break
+            mark(p["id"])
+            # похожие новости из других источников больше не предлагаем
+            state["recent"].append(sorted(words(new))[:200])
+            published += 1
+            print(f"На модерацию: {pid} из {p['id']} (оценка {p['ai']})")
+            save_state(state)
+            continue
+
         try:
             publish(new, p["media"])
         except Exception as e:
@@ -944,10 +1306,11 @@ def main():
         save_state(state)  # сразу, чтобы сбой дальше не привёл к повторной публикации
 
     reasons = ", ".join(f"{k}: {v}" for k, v in stats_reason.items()) or "нет"
-    print(f"ИТОГ: опубликовано {published}, в очереди осталось {max(0, len(ranked) - published)}, "
-          f"отсеяно ({reasons}), за сутки {state['count']}/{DAILY_LIMIT}")
+    what = "отправлено на модерацию" if moderate else "опубликовано"
+    print(f"ИТОГ: {what} {published}, в очереди осталось {max(0, len(ranked) - published)}, "
+          f"отсеяно ({reasons}), за сутки опубликовано {state['count']}/{DAILY_LIMIT}")
     save_state(state)
-    if had_error:
+    if had_error or mod_error:
         sys.exit(1)
 
 
