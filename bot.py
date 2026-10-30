@@ -482,6 +482,46 @@ def handle_update(state, u, now, is_day):
         print(f"{pid}: админ заменил текст/медиа, публикую")
 
 
+def setup_mode(state):
+    """ADMIN_CHAT_ID ещё не задан, а ручная модерация включена: присылать посты некому.
+    Бот ничего не публикует, а только отвечает на /id номером чата, чтобы его можно было вписать в секрет."""
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+            data={
+                "offset": state.get("tg_offset", 0),
+                "timeout": 0,
+                "allowed_updates": json.dumps(["message"]),
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        updates = r.json().get("result", [])
+    except Exception as e:  # текст ошибки requests содержит адрес с токеном, его не печатаем
+        print(f"Сообщения не получены ({type(e).__name__})")
+        return
+    for u in updates:
+        state["tg_offset"] = u["update_id"] + 1
+        msg = u.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/") or text.split()[0].split("@")[0].lower() not in ("/id", "/start"):
+            continue
+        chat_id = msg.get("chat", {}).get("id")
+        try:
+            tg(
+                "sendMessage",
+                chat_id=chat_id,
+                text=(
+                    f"ID этого чата: {chat_id}\n\n"
+                    "Впиши это число в секрет ADMIN_CHAT_ID (GitHub → репозиторий → Settings → "
+                    "Secrets and variables → Actions), и бот начнёт присылать посты сюда."
+                ),
+            )
+            print(f"Ответил на /id в чате {chat_id}")
+        except Exception as e:
+            print(f"Не удалось ответить на /id: {e}")
+
+
 def moderation_step(state, now, is_day):
     """Забирает нажатия, команды и ответы, публикует одобренное, снимает отклонённое и устаревшее.
     Возвращает (были ли ошибки публикации, нужна ли сейчас модерация, вид режима, пояснение)."""
@@ -1071,7 +1111,12 @@ def main():
     state.setdefault("posts", [])
     mode = state.get("mode") or ("manual" if MODERATION else "auto")
     if mode == "manual" and not ADMIN_CHAT_ID:
-        sys.exit("Включена ручная модерация, но не задан секрет ADMIN_CHAT_ID: некому присылать посты")
+        print("Включена ручная модерация, но не задан секрет ADMIN_CHAT_ID: некому присылать посты, "
+              "поэтому ничего не публикую. Напиши боту или в группу /id, он ответит номером чата, "
+              "его надо вписать в секрет ADMIN_CHAT_ID. Либо поставь MODERATION = False.")
+        setup_mode(state)
+        save_state(state)
+        return
     # нажатия, команды и ответы обрабатываем всегда (и ночью, и при достигнутом лимите),
     # moderate = присылать ли сейчас новые посты тебе на одобрение, а не публиковать самому
     mod_error, moderate, kind, why = moderation_step(state, now, is_day)
