@@ -482,26 +482,71 @@ def handle_update(state, u, now, is_day):
         print(f"{pid}: админ заменил текст/медиа, публикую")
 
 
-def setup_mode(state):
-    """ADMIN_CHAT_ID ещё не задан, а ручная модерация включена: присылать посты некому.
-    Бот ничего не публикует, а только отвечает на /id номером чата, чтобы его можно было вписать в секрет."""
+INBOX_DIR = "inbox"  # сюда Cloudflare Worker кладёт нажатия: один файл на обновление (см. worker.js)
+
+
+def read_inbox():
+    out = []
+    if not os.path.isdir(INBOX_DIR):
+        return out
+    for name in sorted(os.listdir(INBOX_DIR)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(INBOX_DIR, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                u = json.load(f)
+            if not isinstance(u, dict) or "update_id" not in u:
+                raise ValueError("нет update_id")
+            out.append(u)
+        except Exception as e:
+            print(f"{path}: не разобран ({type(e).__name__}), удаляю")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return out
+
+
+def drop_inbox(update_id):
+    try:
+        os.remove(os.path.join(INBOX_DIR, f"{int(update_id):012d}.json"))
+    except OSError:
+        pass
+
+
+def collect_updates(state, allowed):
+    """Новые обновления из двух источников: папка inbox (вебхук через Cloudflare Worker)
+    и getUpdates (когда вебхук не включён). Без повторов, по возрастанию update_id."""
+    offset = state.get("tg_offset", 0)
+    found = {}
+    for u in read_inbox():
+        if u["update_id"] < offset:
+            drop_inbox(u["update_id"])  # уже обработано раньше
+        else:
+            found[u["update_id"]] = u
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-            data={
-                "offset": state.get("tg_offset", 0),
-                "timeout": 0,
-                "allowed_updates": json.dumps(["message"]),
-            },
+            data={"offset": offset, "timeout": 0, "allowed_updates": json.dumps(allowed)},
             timeout=30,
         )
         r.raise_for_status()
-        updates = r.json().get("result", [])
+        for u in r.json().get("result", []):
+            found.setdefault(u["update_id"], u)
     except Exception as e:  # текст ошибки requests содержит адрес с токеном, его не печатаем
-        print(f"Сообщения не получены ({type(e).__name__})")
-        return
-    for u in updates:
+        code = getattr(getattr(e, "response", None), "status_code", "")
+        if code != 409:  # 409 = включён вебхук: обновления идут через inbox, это нормально
+            print(f"Нажатия не получены ({type(e).__name__} {code})")
+    return [found[k] for k in sorted(found)]
+
+
+def setup_mode(state):
+    """ADMIN_CHAT_ID ещё не задан, а ручная модерация включена: присылать посты некому.
+    Бот ничего не публикует, а только отвечает на /id номером чата, чтобы его можно было вписать в секрет."""
+    for u in collect_updates(state, ["message"]):
         state["tg_offset"] = u["update_id"] + 1
+        drop_inbox(u["update_id"])
         msg = u.get("message") or {}
         text = (msg.get("text") or "").strip()
         if not text.startswith("/") or text.split()[0].split("@")[0].lower() not in ("/id", "/start"):
@@ -526,29 +571,14 @@ def moderation_step(state, now, is_day):
     """Забирает нажатия, команды и ответы, публикует одобренное, снимает отклонённое и устаревшее.
     Возвращает (были ли ошибки публикации, нужна ли сейчас модерация, вид режима, пояснение)."""
     had_error = False
-    updates = []
-    if ADMIN_CHAT_ID:
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                data={
-                    "offset": state.get("tg_offset", 0),
-                    "timeout": 0,
-                    "allowed_updates": json.dumps(["callback_query", "message"]),
-                },
-                timeout=30,
-            )
-            r.raise_for_status()
-            updates = r.json().get("result", [])
-        except Exception as e:  # текст ошибки requests содержит адрес с токеном, его не печатаем
-            code = getattr(getattr(e, "response", None), "status_code", "")
-            print(f"Нажатия не получены ({type(e).__name__} {code}). Если 409: у бота включён webhook, его надо снять")
+    updates = collect_updates(state, ["callback_query", "message"]) if ADMIN_CHAT_ID else []
     for u in updates:
         state["tg_offset"] = u["update_id"] + 1
         try:
             handle_update(state, u, now, is_day)
         except Exception as e:
             print(f"Обновление {u.get('update_id')} не разобрано: {type(e).__name__}")
+        drop_inbox(u["update_id"])
     if updates:
         print(f"Модерация: получено обновлений {len(updates)}")
 
@@ -1121,6 +1151,13 @@ def main():
     # moderate = присылать ли сейчас новые посты тебе на одобрение, а не публиковать самому
     mod_error, moderate, kind, why = moderation_step(state, now, is_day)
     print(f"Режим: {kind}{' (' + why + ')' if why else ''}")
+    if os.getenv("RUN_MODE") == "moderation":
+        # быстрый запуск по нажатию кнопки (вебхук): источники и ИИ не трогаем, чтобы не копить лишние посты
+        print("Быстрый запуск: обработаны только нажатия, команды и одобренные посты")
+        save_state(state)
+        if mod_error:
+            sys.exit(1)
+        return
     # при уходе в автопубликацию из-за молчания предупреждаем один раз, чтобы это не было сюрпризом
     if kind == "idle" and not state.get("idle_notified"):
         state["idle_notified"] = True
