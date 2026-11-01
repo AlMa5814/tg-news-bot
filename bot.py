@@ -53,7 +53,7 @@ AUTO_RELEASE_PER_RUN = 1      # в авто-режиме: сколько нео�
 MODERATE_AT_NIGHT = True      # False = ночью (23:00-08:00 МСК) посты выходят сами, без одобрения
 MAX_PENDING = 8               # сколько постов может одновременно ждать твоего решения
 PENDING_TTL_HOURS = 6         # неодобренный пост через столько часов считается устаревшим и снимается
-DAILY_LIMIT = 180              # максимум постов в сутки
+DAILY_LIMIT = 80              # максимум постов в сутки
 RECENT_FOR_AI = 15            # сколько последних постов показывать ИИ для проверки повторов
 MIN_SCORE = 5                 # новости с оценкой ИИ ниже этого (шкала 1-10) не публикуем
 POOL_SIZE = 20                # сколько свежих постов оценивать за раз
@@ -102,14 +102,18 @@ EMOJI = re.compile(
     "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B50\u2B06\uFE0F\u200d]"
 )
 
-PROMPT = """Ты редактор новостного канала. Перепиши новость своими словами, \
-сохранив все факты, имена, цифры и даты. Ничего не выдумывай и не добавляй от себя.
-Требования:
-- длина примерно {n} символов (допустимо плюс-минус 20 процентов)
-- без эмодзи, без хэштегов, без ссылок и упоминаний через @
+PROMPT = """Действуй как профессиональный редактор Telegram-канала. Твоя задача: переписать исходный текст так, чтобы он стал чётким, информативным и удобным для чтения.
+1. Начинай с яркого короткого лида, раскрывающего суть новости.
+2. Разбивай текст на блоки по 2-3 предложения, блоки отделяй пустой строкой.
+3. Используй полужирный шрифт для выделения ключевых дат, имён или главных фактов: оборачивай их в теги <b></b> (других тегов и markdown-звёздочек не используй).
+4. Перечисления и списки оформляй маркированными списками: каждый пункт с новой строки, начинается с символа "•".
+5. Поддерживай строгий, объективный тон. Эмодзи минимум: максимум пара символов, и только если они к месту.
+Дополнительно:
+- сохрани все факты, имена, цифры и даты, ничего не выдумывай и не добавляй от себя
+- длина примерно {n} символов (допустимо плюс-минус 30 процентов)
+- без хэштегов, без ссылок и упоминаний через @
 - без обращений к читателям и без призывов подписаться
-- нейтральный информационный стиль, русский язык
-- верни только текст поста, без пояснений и вступлений
+- русский язык, верни только текст поста, без пояснений и вступлений
 Если текст является рекламой, розыгрышем, приглашением подписаться или не \
 является новостью, ответь одним словом: SKIP
 
@@ -202,7 +206,7 @@ def download(url):
     return r.content
 
 
-def send_media(media, caption, upload):
+def send_media(media, caption, upload, html=True):
     """Одно фото/видео или альбом. upload=False: Telegram сам скачивает по ссылке,
     upload=True: скрипт скачивает файлы и загружает их сам (надёжнее для больших)."""
     files = {}
@@ -213,6 +217,8 @@ def send_media(media, caption, upload):
         data = {"chat_id": CHANNEL}
         if caption:
             data["caption"] = caption
+            if html:
+                data["parse_mode"] = "HTML"
         if not is_photo:
             data["supports_streaming"] = "true"
         if upload:
@@ -233,32 +239,90 @@ def send_media(media, caption, upload):
             entry["media"] = item["url"]
         if i == 0 and caption:
             entry["caption"] = caption
+            if html:
+                entry["parse_mode"] = "HTML"
         group.append(entry)
     tg("sendMediaGroup", files=files or None, chat_id=CHANNEL, media=json.dumps(group))
 
 
+import html as _html
+
+_B_OPEN, _B_CLOSE = "<b>", "</b>"
+
+
+def strip_tags(text):
+    """Текст без тегов форматирования (для превью, дубликатов и запасной отправки)."""
+    return _html.unescape(re.sub(r"</?b>", "", text))
+
+
+def to_html(text, max_len=3500):
+    """Приводит текст к виду для parse_mode=HTML: оставляем только <b>, остальное экранируем."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = text.replace("`", "")
+    text = re.sub(r"(?m)^[ \t]*[-*–—][ \t]+", "• ", text)  # маркеры списка
+    text = text.replace(_B_OPEN, "\x01").replace(_B_CLOSE, "\x02")
+    text = _html.escape(text, quote=False)
+    text = text.replace("\x01", _B_OPEN).replace("\x02", _B_CLOSE)
+    # длина считается по видимому тексту; обрезаем по границе слова, не разрывая тег
+    if len(strip_tags(text)) > max_len:
+        text = text[: max_len + 40].rsplit(" ", 1)[0]
+        text = re.sub(r"<b?$|<$", "", text)
+    # баланс тегов: лишние закрывающие и вложенные убираем, незакрытый закрываем
+    out, depth = [], 0
+    for part in re.split(r"(</?b>)", text):
+        if part == _B_OPEN:
+            if depth == 0:
+                out.append(part)
+                depth = 1
+        elif part == _B_CLOSE:
+            if depth == 1:
+                out.append(part)
+                depth = 0
+        else:
+            out.append(part)
+    if depth:
+        out.append(_B_CLOSE)
+    res = "".join(out)
+    return re.sub(r"<b>\s*</b>", "", res).strip()
+
+
 def publish(text, media):
+    """Публикует пост с форматированием (HTML). Если Telegram не разобрал разметку, шлёт без неё."""
+    try:
+        _publish(text, media, True)
+    except RuntimeError as e:
+        if "parse entities" not in str(e):
+            raise
+        print("Telegram не принял разметку, публикую без форматирования")
+        _publish(strip_tags(text), media, False)
+
+
+def _publish(text, media, html):
     head = f"{HEADER_EMOJI} " if HEADER_EMOJI else ""
     final = head + text + (f"\n\n{SIGNATURE}" if SIGNATURE else "")
+    extra = {"parse_mode": "HTML"} if html else {}
     media = media[:10] if USE_MEDIA else []
     if media:
-        caption = final if len(final) <= 1024 else None  # лимит подписи в Telegram
+        caption = final if len(strip_tags(final)) <= 1024 else None  # лимит подписи в Telegram
         sent = False
         for upload in (False, True):
             try:
-                send_media(media, caption, upload)
+                send_media(media, caption, upload, html)
                 sent = True
                 break
+            except RuntimeError as e:
+                if "parse entities" in str(e):
+                    raise
+                print(f"Медиа не отправилось ({'с загрузкой' if upload else 'по ссылке'}): {e}")
             except Exception as e:
-                how = "с загрузкой" if upload else "по ссылке"
-                print(f"Медиа не отправилось ({how}): {e}")
+                print(f"Медиа не отправилось ({'с загрузкой' if upload else 'по ссылке'}): {e}")
         if sent:
             if caption is None:  # текст длиннее 1024 знаков идёт следом отдельным сообщением
-                tg("sendMessage", chat_id=CHANNEL, text=final, disable_web_page_preview="true")
+                tg("sendMessage", chat_id=CHANNEL, text=final, disable_web_page_preview="true", **extra)
             return
         # пост с медиа не превращаем в текстовый: повторим при следующем запуске
         raise RuntimeError("медиа не отправилось ни по ссылке, ни с загрузкой")
-    tg("sendMessage", chat_id=CHANNEL, text=final, disable_web_page_preview="true")
+    tg("sendMessage", chat_id=CHANNEL, text=final, disable_web_page_preview="true", **extra)
 
 
 # ---------------------- ручная модерация ----------------------
@@ -291,14 +355,16 @@ def mod_buttons(pid, item):
 
 def mod_preview(item):
     body = item["text"]
-    if len(body) > 3200:
-        body = body[:3200] + "…"
+    if len(strip_tags(body)) > 3200:
+        body = to_html(body, 3200) + "…"
     head = f"{HEADER_EMOJI} " if HEADER_EMOJI else ""
     score = item.get("ai")
+    src = _html.escape(str(item["source"]))
+    sid = _html.escape(str(item["src_id"]))
     return (
-        f"На модерацию · {item['source']} · оценка {score if score is not None else '?'}\n"
+        f"На модерацию · {src} · оценка {score if score is not None else '?'}\n"
         f"Медиа: {mod_media_summary(item['media'])}\n"
-        f"Оригинал: https://t.me/{item['src_id']}\n\n"
+        f"Оригинал: https://t.me/{sid}\n\n"
         f"{head}{body}\n\n"
         "Ответом на это сообщение можно заменить текст или фото. "
         "Пост с твоей правкой выйдет сразу."
@@ -312,7 +378,7 @@ def mod_close(item, label):
             "editMessageText",
             chat_id=ADMIN_CHAT_ID,
             message_id=item["msg_id"],
-            text=f"{label}\n\n{item['text'][:300]}",
+            text=f"{label}\n\n{strip_tags(item['text'])[:300]}",
             disable_web_page_preview="true",
         )
     except Exception as e:
@@ -336,6 +402,7 @@ def send_for_moderation(state, now, p, text):
         "sendMessage",
         chat_id=ADMIN_CHAT_ID,
         text=mod_preview(item),
+        parse_mode="HTML",
         reply_markup=mod_buttons(pid, item),
         disable_web_page_preview="true",
     )
@@ -398,6 +465,50 @@ def handle_command(state, text, now, is_day):
         print(f"Не удалось ответить на команду: {e}")
 
 
+def handle_shorts_button(state, cq, action, sid):
+    """Кнопки под роликом Shorts: загрузить на YouTube или отклонить."""
+    shorts = state.setdefault("shorts", {})
+    item = shorts.get(sid)
+    note = ""
+    msg = cq.get("message") or {}
+    chat_id = msg.get("chat", {}).get("id") or ADMIN_CHAT_ID
+    if not item:
+        note = "Ролик уже обработан или устарел"
+    elif action == "yt_no":
+        shorts.pop(sid, None)
+        note = "Отклонено"
+    else:
+        try:
+            import yt
+
+            if not yt.configured():
+                note = "YouTube не подключён: нет секретов YT_*"
+            else:
+                info = tg("getFile", file_id=item["file_id"])
+                r = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info['file_path']}", timeout=180)
+                r.raise_for_status()
+                os.makedirs("shorts_work", exist_ok=True)
+                path = os.path.join("shorts_work", f"up_{sid}.mp4")
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                vid = yt.upload(path, item["title"] + " #Shorts", item["desc"], tags=["Shorts", "новости", "юмор"])
+                shorts.pop(sid, None)
+                note = "Загружено на YouTube"
+                tg("sendMessage", chat_id=chat_id, text=f"Ролик загружен: https://youtube.com/shorts/{vid}")
+        except Exception as e:
+            note = "Не удалось загрузить, смотри сообщение"
+            alert(f"YouTube: загрузка ролика {sid} не удалась: {type(e).__name__} {str(e)[:300]}")
+    try:
+        tg("answerCallbackQuery", callback_query_id=cq["id"], text=note)
+    except Exception:
+        pass
+    if item is None or action == "yt_no" or note == "Загружено на YouTube":
+        try:
+            tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg.get("message_id"), reply_markup=json.dumps({"inline_keyboard": []}))
+        except Exception:
+            pass
+
+
 def handle_update(state, u, now, is_day):
     """Одно обновление от Telegram: нажатие кнопки, команда или ответ на превью. Чужих игнорируем."""
     pend = state["pending"]
@@ -409,6 +520,9 @@ def handle_update(state, u, now, is_day):
             return
         state["last_admin"] = now.isoformat()
         action, _, pid = (cq.get("data") or "").partition(":")
+        if action in ("yt_ok", "yt_no"):
+            handle_shorts_button(state, cq, action, pid)
+            return
         item = pend.get(pid)
         note = ""
         if not item:
@@ -475,7 +589,7 @@ def handle_update(state, u, now, is_day):
         item["media_on"] = True
         changed = True
     if new_text:
-        item["text"] = new_text[:3500]
+        item["text"] = to_html(new_text)
         changed = True
     if changed:
         item["decision"] = "ok"
@@ -633,7 +747,7 @@ def moderation_step(state, now, is_day):
             state["count"] = state.get("count", 0) + 1
             state["last_pub"] = now.isoformat()
             state["media_hist"].append(1 if media else 0)
-            state["posts"].append(item["text"][:250].replace("\n", " "))
+            state["posts"].append(strip_tags(item["text"])[:250].replace("\n", " "))
             mod_close(item, "✅ Опубликовано" if moderate else "✅ Опубликовано (без одобрения)")
             del state["pending"][pid]
             print(f"Опубликован пост {pid} из {item['src_id']}")
@@ -1111,14 +1225,24 @@ def ask_ai(prompt):
     return None
 
 
+def limit_emoji(text, keep=2):
+    """Не больше keep эмодзи в тексте: остальные убираем."""
+    n = [0]
+
+    def f(m):
+        n[0] += 1
+        return m.group(0) if n[0] <= keep else ""
+
+    return EMOJI.sub(f, text)
+
+
 def postprocess(text):
-    text = text.replace("**", "").replace("`", "")
-    text = EMOJI.sub("", text)
+    text = limit_emoji(text)
     text = re.sub(r"#\w+", "", text)
     text = re.sub(r"@\w+", "", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text[:3500]
+    return to_html(text)
 
 
 # ---------------------- основной цикл ----------------------
@@ -1382,7 +1506,7 @@ def main():
         state["last_pub"] = now.isoformat()
         state["media_hist"].append(1 if p["media"] else 0)
         state["recent"].append(sorted(words(new))[:200])
-        state["posts"].append(new[:250].replace("\n", " "))
+        state["posts"].append(strip_tags(new)[:250].replace("\n", " "))
         published += 1
         print(f"Опубликован пост из {p['id']} (оценка {p['ai']}, просмотры {p['views']})")
         save_state(state)  # сразу, чтобы сбой дальше не привёл к повторной публикации
